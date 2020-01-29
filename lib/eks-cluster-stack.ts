@@ -1,11 +1,18 @@
 import { InstanceType, InstanceClass, InstanceSize, Vpc, VpcProps, SubnetType } from '@aws-cdk/aws-ec2'
-import { AutoScalingGroup, UpdateType } from '@aws-cdk/aws-autoscaling';
-import { Cluster, EksOptimizedImage, NodeType } from '@aws-cdk/aws-eks';
+import { CfnNodegroup, Cluster } from '@aws-cdk/aws-eks';
 import { ManagedPolicy, PolicyStatement, Role, ServicePrincipal, AccountRootPrincipal } from '@aws-cdk/aws-iam';
 import { App, CfnOutput, Stack, StackProps } from '@aws-cdk/core';
 
 export interface Props extends StackProps {
   clusterName: string;
+}
+
+interface ClusterProps {
+  clusterAdminRole: Role;
+  clusterName: string;
+  clusterRole: Role;
+  nodeGroupRole: Role;
+  vpc: Vpc;
 }
 
 export class EksClusterStack extends Stack {
@@ -15,7 +22,14 @@ export class EksClusterStack extends Stack {
     const vpc = this.createVpc();
     const clusterRole = this.createClusterRole();
     const clusterAdminRole = this.createClusterAdminRole();
-    const cluster = this.createCluster(clusterName, vpc, clusterAdminRole, clusterRole);
+    const nodeGroupRole = this.createNodeGroupRole();
+    const cluster = this.createCluster({
+      clusterAdminRole,
+      clusterName,
+      clusterRole,
+      nodeGroupRole,
+      vpc,
+    });
 
     new CfnOutput(this, 'clusterRole', {
       value: cluster.clusterArn,
@@ -76,7 +90,30 @@ export class EksClusterStack extends Stack {
     }); 
   }
 
-  private createCluster(clusterName: string, vpc: Vpc, clusterAdminRole: Role, clusterRole: Role): Cluster {
+  private createNodeGroupRole(): Role {
+    const role = new Role(this, 'eks-node-group-role', {
+      assumedBy: new ServicePrincipal('ec2.amazonaws.com'),
+      managedPolicies: [
+        ManagedPolicy.fromAwsManagedPolicyName('AmazonEKSWorkerNodePolicy'),
+        ManagedPolicy.fromAwsManagedPolicyName('AmazonEKS_CNI_Policy'),
+        ManagedPolicy.fromAwsManagedPolicyName('AmazonEC2ContainerRegistryReadOnly'),
+      ],
+    });
+
+    role.addToPolicy(
+      new PolicyStatement({
+        actions: [
+          'sts:AssumeRole',
+        ],
+        resources: ['*'],
+      }),
+    );
+
+    return role;
+  }
+
+  private createCluster(props: ClusterProps): Cluster {
+    const { clusterAdminRole, clusterRole, clusterName, nodeGroupRole, vpc } = props;
     const cluster = new Cluster(this, clusterName, {
       vpc,
       clusterName,
@@ -85,22 +122,19 @@ export class EksClusterStack extends Stack {
       defaultCapacity: 0,
     });
 
-    const asg = new AutoScalingGroup(this, `${clusterName}-asg`, {
-        vpc,
-        instanceType: InstanceType.of(InstanceClass.T3, InstanceSize.LARGE),
-        machineImage: new EksOptimizedImage({
-          nodeType: NodeType.STANDARD,
-        }),
-        minCapacity: 1,
-        maxCapacity: 2,
-        desiredCapacity: 1,
-        updateType: UpdateType.ROLLING_UPDATE,
-        vpcSubnets: {
-          subnets: vpc.privateSubnets
+    new CfnNodegroup(this, `${clusterName}-node-group`, {
+      clusterName: cluster.clusterName,
+      nodeRole: nodeGroupRole.roleArn,
+      subnets: vpc.privateSubnets.map(it => it.subnetId),
+      scalingConfig: {
+        desiredSize: 1,
+        maxSize: 2,
+        minSize: 1,
       },
+      instanceTypes: [
+        InstanceType.of(InstanceClass.T3, InstanceSize.LARGE).toString(),
+      ],
     });
-
-    cluster.addAutoScalingGroup(asg, {});
     
     return cluster;
   }
